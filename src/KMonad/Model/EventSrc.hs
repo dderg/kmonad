@@ -8,7 +8,6 @@ module KMonad.Model.EventSrc
 
 import KMonad.Prelude
 import KMonad.Util
-import KMonad.Keyboard
 
 -- | Used when a component needs an event source.
 -- The benefit of this over spawning a new thread and awaiting the async option are the following:
@@ -17,20 +16,20 @@ import KMonad.Keyboard
 -- Instead it needs to construct an STM action including those of the event source.
 -- Due to the existentially qualified nature, we can only work with it via
 -- pattern matching inside a function argument.
-data EventSrc m = forall a. EventSrc
+data EventSrc ev m = forall a. EventSrc
   { tryESrc :: STM a
-  , postESrc :: a -> m (Maybe KeyEvent)
+  , postESrc :: a -> m (Maybe ev)
   }
 
-unliftESrc :: (m (Maybe KeyEvent) -> IO (Maybe KeyEvent)) -> EventSrc m -> EventSrc IO
+unliftESrc :: (m (Maybe ev) -> IO (Maybe ev)) -> EventSrc ev m -> EventSrc ev IO
 unliftESrc u EventSrc{tryESrc, postESrc} = EventSrc tryESrc (u . postESrc)
 
-pullESrc :: MonadIO m => EventSrc m -> m KeyEvent
+pullESrc :: MonadIO m => EventSrc ev m -> m ev
 pullESrc EventSrc{tryESrc, postESrc} = go
  where go = atomically tryESrc >>= postESrc >>= maybe go pure
 
 -- | Spawns a new thread to continously pull
-pullToESrc :: (HasLogFunc e, MonadIO m) => Text -> RIO e KeyEvent -> ContT r (RIO e) (EventSrc m)
+pullToESrc :: (HasLogFunc e, MonadIO m) => Text -> RIO e ev -> ContT r (RIO e) (EventSrc ev m)
 pullToESrc tname pull = do
   channel <- newEmptyTMVarIO
   launch_ tname $ do
@@ -39,5 +38,5 @@ pullToESrc tname pull = do
 
   pure $ toESrc channel
 
-toESrc :: MonadIO m => TMVar KeyEvent -> EventSrc m
+toESrc :: MonadIO m => TMVar ev -> EventSrc ev m
 toESrc channel = EventSrc (takeTMVar channel) (pure . Just)

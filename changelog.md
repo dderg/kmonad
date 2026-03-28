@@ -38,6 +38,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0)
 - Fixed `sticky-key` as tap in `tap-hold` style buttons. (#1014)
 - Fixed nix system variable renamed deprecation warning. (#1046)
 - Fixed race condition when key event arrives while timeout is processed (#1049)
+- Fixed modifier key releases bypassing the Sluice during tap-hold resolution,
+  causing incorrect key ordering with home row mods (#256, #307, #466)
 
 ## 0.4.4 – 2025-04-11
 

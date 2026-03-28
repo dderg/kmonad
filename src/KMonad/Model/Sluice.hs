@@ -23,8 +23,7 @@ where
 
 import KMonad.Prelude
 
-import KMonad.Keyboard
-
+import KMonad.Model.Action (WrappedEvent(..))
 import KMonad.Model.EventSrc
 
 --------------------------------------------------------------------------------
@@ -36,29 +35,26 @@ import KMonad.Model.EventSrc
 -- never be interrupted, therefore we can simply use 'IORef' and sidestep all
 -- the STM complications.
 data Sluice = Sluice
-  { eventSrc  :: EventSrc IO      -- ^ Where we get our 'KeyEvent's from
-  , _blocked  :: IORef Int        -- ^ How many locks have been applied to the sluice
-  , _blockBuf :: IORef [KeyEvent] -- ^ Internal buffer to store events while closed
+  { eventSrc  :: EventSrc WrappedEvent IO -- ^ Where we get our 'WrappedEvent's from
+  , _blocked  :: IORef Int                -- ^ How many locks have been applied to the sluice
+  , _blockBuf :: IORef [WrappedEvent]     -- ^ Internal buffer to store events while closed
   }
 makeLenses ''Sluice
 
 -- | Create a new 'Sluice' environment
-mkSluice' :: MonadUnliftIO m => EventSrc m -> m Sluice
+mkSluice' :: MonadUnliftIO m => EventSrc WrappedEvent m -> m Sluice
 mkSluice' s = withRunInIO $ \u -> do
   bld <- newIORef 0
   buf <- newIORef []
   pure $ Sluice (unliftESrc u s) bld buf
 
 -- | Create a new 'Sluice' environment, but do so in a ContT context
-mkSluice :: MonadUnliftIO m => EventSrc m -> ContT r m Sluice
+mkSluice :: MonadUnliftIO m => EventSrc WrappedEvent m -> ContT r m Sluice
 mkSluice = lift . mkSluice'
 
 
 --------------------------------------------------------------------------------
 -- $op
---
--- The following code deals with simple operations on the environment, like
--- blocking and unblocking the sluice.
 
 -- | Increase the block-count by 1
 block :: HasLogFunc e => Sluice -> RIO e ()
@@ -69,15 +65,7 @@ block s = do
 
 -- | Set the Sluice to unblocked mode, return a list of all the stored events
 -- that should be rerun, in the correct order (head was first-in, etc).
---
--- NOTE: After successfully unblocking the 'Sluice' will be empty, it is the
--- caller's responsibility to insert the returned events at an appropriate
--- location in the 'KMonad.App.App'.
---
--- We do this in KMonad by writing the events into the
--- 'KMonad.Model.Dispatch.Dispatch's rerun buffer. (this happens in the
--- "KMonad.App" module.)
-unblock :: HasLogFunc e => Sluice -> RIO e [KeyEvent]
+unblock :: HasLogFunc e => Sluice -> RIO e [WrappedEvent]
 unblock s = do
   modifyIORef' (s^.blocked) (\n -> n - 1)
   readIORef (s^.blocked) >>= \case
@@ -87,7 +75,7 @@ unblock s = do
       logDebug $ "Unblocking input stream, " <>
         if null es
         then "no stored events"
-        else "rerunning:\n" <> (display . unlines . map textDisplay $ reverse es)
+        else "rerunning " <> display (length es) <> " stored events"
       pure $ reverse es
     n -> do
       logDebug $ "Block level set to: " <> display n
@@ -96,26 +84,20 @@ unblock s = do
 
 --------------------------------------------------------------------------------
 -- $loop
---
--- The following code deals with how a 'Sluice' fits into the KMonad pull-chain.
--- As long as we are blocked, we do not return any events, but keep storing them
--- internally. When we are unblocked, events simply pass through.
-
 
 -- | Try to read from the Sluice, if we are blocked, store the event internally
--- and return Nothing. If we are unblocked, return Just the KeyEvent.
-pull :: HasLogFunc e => Sluice -> EventSrc (RIO e)
+-- and return Nothing. If we are unblocked, return Just the WrappedEvent.
+pull :: HasLogFunc e => Sluice -> EventSrc WrappedEvent (RIO e)
 pull s@Sluice{eventSrc = EventSrc{tryESrc, postESrc}} = EventSrc
   { tryESrc = tryESrc
   , postESrc = liftIO . postESrc >=> maybe (pure Nothing) step
   }
  where
-  step e = do
+  step we = do
     readIORef (s^.blocked) >>= \case
-      0 -> pure $ Just e
+      0 -> pure $ Just we
       _ -> do
-        modifyIORef' (s^.blockBuf) (e:)
-        readIORef (s^.blockBuf) >>= \es -> do
-          let xs = map ((" - " <>) . textDisplay) es
-          logDebug . display . unlines $ "Storing event, current store: ":xs
+        modifyIORef' (s^.blockBuf) (we:)
+        readIORef (s^.blockBuf) >>= \es ->
+          logDebug $ "Storing event, buffer size: " <> display (length es)
         pure Nothing

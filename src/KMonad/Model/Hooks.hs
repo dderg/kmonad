@@ -11,9 +11,6 @@ Part of the KMonad deferred-decision mechanics are implemented using hooks,
 which will call predicates and actions on future keypresses and/or timer events.
 The 'Hooks' component is the concrete implementation of this functionality.
 
-In the sequencing of components, this happens second, right after the
-'KMonad.App.Dispatch.Dispatch' component.
-
 -}
 module KMonad.Model.Hooks
   ( Hooks
@@ -40,19 +37,6 @@ import qualified RIO.HashMap as M
 --------------------------------------------------------------------------------
 -- $hooks
 
-
-
--- -- | A 'Hook' contains the 'KeyPred' and 'Callback'
--- newtype Hook = Hook (KeyPred, Callback IO)
--- makeWrapped ''Hook
-
--- -- | Create a new 'Hook' value
--- mkHook :: MonadUnliftIO m => KeyPred -> Callback m -> m Hook
--- mkHook p c = withRunInIO $ \u -> pure $ Hook (p, (u . c))
-
---------------------------------------------------------------------------------
--- $env
-
 data Entry = Entry
   { _time  :: SystemTime
   , _eHook :: Hook IO
@@ -66,27 +50,26 @@ type Store = M.HashMap Unique Entry
 -- | The 'Hooks' environment that is required for keeping track of all the
 -- different targets and callbacks.
 data Hooks = Hooks
-  { eventSrc    :: EventSrc IO   -- ^ Where we get our events from
-  , _injectTmr  :: TMVar Unique  -- ^ Used to signal timeouts
-  , _hooks      :: TVar Store    -- ^ Store of hooks
+  { eventSrc    :: EventSrc WrappedEvent IO -- ^ Where we get our events from
+  , _injectTmr  :: TMVar Unique             -- ^ Shared timer signal channel
+  , _hooks      :: TVar Store               -- ^ Store of hooks
   }
 makeLenses ''Hooks
 
--- | Create a new 'Hooks' environment which reads events from the provided action
-mkHooks' :: MonadUnliftIO m => EventSrc m -> m Hooks
-mkHooks' s = withRunInIO $ \u -> do
-  itr <- newEmptyTMVarIO
+-- | Create a new 'Hooks' environment which reads events from the provided action.
+-- Takes a shared timer TMVar (owned by Dispatch).
+mkHooks' :: MonadUnliftIO m => TMVar Unique -> EventSrc WrappedEvent m -> m Hooks
+mkHooks' tmr s = withRunInIO $ \u -> do
   hks <- newTVarIO M.empty
-  pure $ Hooks (unliftESrc u s) itr hks
+  pure $ Hooks (unliftESrc u s) tmr hks
 
 -- | Create a new 'Hooks' environment, but as a 'ContT' monad to avoid nesting
-mkHooks :: MonadUnliftIO m => EventSrc m -> ContT r m Hooks
-mkHooks = lift . mkHooks'
+mkHooks :: MonadUnliftIO m => TMVar Unique -> EventSrc WrappedEvent m -> ContT r m Hooks
+mkHooks tmr = lift . mkHooks' tmr
 
 -- | Convert a hook in some UnliftIO monad into an IO version, to store it in Hooks
 ioHook :: MonadUnliftIO m => Hook m -> m (Hook IO)
 ioHook h = withRunInIO $ \u -> do
-
   t <- case _hTimeout h of
     Nothing -> pure Nothing
     Just t' -> pure . Just $ Timeout (t'^.delay) (u (_action t'))
@@ -96,9 +79,6 @@ ioHook h = withRunInIO $ \u -> do
 
 --------------------------------------------------------------------------------
 -- $op
---
--- The following code deals with simple operations on the environment, like
--- inserting and removing hooks.
 
 -- | Insert a hook, along with the current time, into the store
 register :: (HasLogFunc e)
@@ -141,9 +121,6 @@ runTimeout hs tag = do
 
 --------------------------------------------------------------------------------
 -- $run
---
--- The following code deals with how we check hooks against incoming events, and
--- how this updates the 'Hooks' environment.
 
 -- | Run the function stored in a Hook on the event and the elapsed time
 runEntry :: HasLogFunc e => SystemTime -> KeyEvent -> (Unique, Entry) -> RIO e Catch
@@ -168,26 +145,22 @@ runHooks hs e = do
 
 --------------------------------------------------------------------------------
 -- $loop
---
--- The following code deals with how to use the 'Hooks' component as part of a
--- pull-chain. It contains logic for how to try to pull events from upstream and
--- check them against the hooks, and for how to keep stepping until an unhandled
--- event comes through.
 
--- | Pull 1 event from the '_eventSrc'. If that action is not caught by any
--- callback, then return it (otherwise return Nothing). At the same time, keep
--- reading the timer-cancellation inject point and handle any cancellation as it
--- comes up.
+-- | Pull 1 event from the '_eventSrc'. Handle WrappedEvents appropriately:
+-- - WrappedTag: run the timeout action for that hook, return Nothing
+-- - WrappedKeyEvent: run hooks on the key event
 pull :: (HasLogFunc e)
-  => Hooks                  -- ^ The 'Hooks' environment
-  -> EventSrc (RIO e)       -- ^ An action that returns perhaps the next event
+  => Hooks
+  -> EventSrc WrappedEvent (RIO e)
 pull h@Hooks{eventSrc = EventSrc{tryESrc, postESrc}} = EventSrc
-  { -- Handle any timer event first, and then try to read from the source
-    tryESrc = (Left <$> takeTMVar (h^.injectTmr)) `orElse` (Right <$> tryESrc)
-
-  -- Keep taking and cancelling timers until we encounter a key event, then run
-  -- the hooks on that event.
-  , postESrc = \case
-    Left  t -> runTimeout h t $> Nothing -- We caught a hook timeout
-    Right e -> liftIO (postESrc e) >>= maybe (pure Nothing) (runHooks h) -- We caught a real event
+  { tryESrc = tryESrc
+  , postESrc = \a -> liftIO (postESrc a) >>= \case
+    Nothing -> pure Nothing
+    Just (WrappedTag tag) -> do
+      runTimeout h tag
+      pure Nothing
+    Just (WrappedKeyEvent e) ->
+      runHooks h e >>= \case
+        Nothing -> pure Nothing
+        Just e' -> pure $ Just (WrappedKeyEvent e')
   }

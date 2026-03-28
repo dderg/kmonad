@@ -23,7 +23,7 @@ import KMonad.App.Types
 import KMonad.Keyboard
 import KMonad.Util
 import KMonad.Model
-
+import KMonad.Model.Action (WrappedEvent(..))
 
 import KMonad.Model.EventSrc
 import qualified KMonad.Model.Dispatch as Dp
@@ -85,16 +85,20 @@ initAppEnv cfg = do
   src <- using $ cfg^.keySourceDev
 
   -- Initialize the pull-chain components
-  dsp <- Dp.mkDispatch =<< pullToESrc "receiver_proc" (awaitKey src)
-  ihk <- Hs.mkHooks    $ Dp.pull  dsp
-  slc <- Sl.mkSluice   $ Hs.pull  ihk
+  itr  <- lift newEmptyTMVarIO
+  dsp  <- Dp.mkDispatch itr =<< pullToESrc "receiver_proc" (awaitKey src)
+  ihkP <- Hs.mkHooks itr $ Dp.pull dsp
+  slc  <- Sl.mkSluice    $ Hs.pull ihkP
+  ihk  <- Hs.mkHooks itr $ Sl.pull slc
 
   -- Initialize the button environments in the keymap
   phl <- Km.mkKeymap (cfg^.firstLayer) (cfg^.keymapCfg)
 
   -- Initialize output components
   otv <- lift newEmptyTMVarIO
-  ohk <- Hs.mkHooks $ toESrc otv
+  otr <- lift newEmptyTMVarIO
+  let outESrc = EventSrc (takeTMVar otv) (\ke -> pure . Just $ WrappedKeyEvent ke)
+  ohk <- Hs.mkHooks otr outESrc
 
   -- Setup thread to read from outHooks and emit to keysink
   launch_ "emitter_proc" $ do
@@ -112,9 +116,10 @@ initAppEnv cfg = do
     , _keySink   = snk
     , _keySource = src
 
-    , _dispatch  = dsp
-    , _inHooks   = ihk
-    , _sluice    = slc
+    , _dispatch    = dsp
+    , _inHooksPrio = ihkP
+    , _sluice      = slc
+    , _inHooks     = ihk
 
     , _keymap    = phl
     , _outHooks  = ohk
@@ -138,7 +143,7 @@ pressKey c =
       ft <- view fallThrough
       when ft $ do
           emit $ mkPress c
-          await (isReleaseOf c) $ \_ -> do
+          await InputHook (isReleaseOf c) $ \_ -> do
             emit $ mkRelease c
             pure Catch
 
@@ -150,7 +155,7 @@ pressKey c =
         app <- view appEnv
         runRIO (KEnv app b) $ do
           runAction a
-          awaitMy Release $ do
+          awaitMy InputHook Release $ do
             runBEnv b Release >>= \case
               Nothing -> pure ()
               Just a  -> runAction a
@@ -167,14 +172,15 @@ pressKey c =
 -- 1. Pull from the pull-chain until an unhandled event reaches us.
 -- 2. If that event is a 'Press' we use our keymap to trigger an action.
 loop :: RIO AppEnv ()
-loop = forever $ view sluice >>= pullESrc . Sl.pull >>= \case
-  e | e^.switch == Press -> pressKey $ e^.keycode
+loop = forever $ view inHooks >>= pullESrc . Hs.pull >>= \case
+  WrappedTag _ -> pure ()  -- Timer already handled by hooks layer
+  WrappedKeyEvent e
+    | e^.switch == Press -> pressKey $ e^.keycode
     | e^.switch == Release -> do
-      view keymap >>= flip Km.lookupKey (e^.keycode) >>= \case
-        Nothing -> pure () -- happens frequently with `fallthrough false`
-        -- Not perfect, since a layer change might have happened but better than nothing
-        Just _ -> logWarn "Unhandled release of mapped key"
-  _                      -> pure ()
+        view keymap >>= flip Km.lookupKey (e^.keycode) >>= \case
+          Nothing -> pure () -- happens frequently with `fallthrough false`
+          Just _ -> logWarn "Unhandled release of mapped key"
+    | otherwise -> pure ()
 
 -- | Run KMonad using the provided configuration
 startApp :: HasLogFunc e => AppCfg -> RIO e ()

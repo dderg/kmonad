@@ -21,6 +21,7 @@ module KMonad.Model.Action
   (
     KeyPred
   , Catch(..)
+  , WrappedEvent(..)
   , Trigger(..)
   , Timeout(..)
   , HookLocation(..)
@@ -60,6 +61,8 @@ where
 
 import KMonad.Prelude hiding (timeout)
 
+import Data.Unique
+
 import KMonad.Keyboard
 import KMonad.Util
 
@@ -75,6 +78,16 @@ instance Semigroup Catch where
 
 instance Monoid Catch where
   mempty = NoCatch
+
+-- | Events flowing through the internal pipeline. Can be either a key event
+-- or a timer signal (identified by a Unique tag).
+data WrappedEvent
+  = WrappedKeyEvent !KeyEvent  -- ^ An actual key event
+  | WrappedTag !Unique         -- ^ A timer/timeout signal
+
+instance Show WrappedEvent where
+  show (WrappedKeyEvent e) = "WrappedKeyEvent " ++ show e
+  show (WrappedTag u) = "WrappedTag " ++ show (hashUnique u)
 
 -- | The packet used to trigger a KeyFun, containing info about the event and
 -- how long since the Hook was registered.
@@ -93,8 +106,9 @@ makeClassy ''Trigger
 
 -- | ADT signalling where to install a hook
 data HookLocation
-  = InputHook  -- ^ Install the hook immediately after receiving a 'KeyEvent'
-  | OutputHook -- ^ Install the hook just before emitting a 'KeyEvent'
+  = InputHookPrio -- ^ Install the hook before the Sluice (for hooks that use hold)
+  | InputHook     -- ^ Install the hook after the Sluice (for emission hooks)
+  | OutputHook    -- ^ Install the hook just before emitting a 'KeyEvent'
   deriving (Eq, Show)
 
 -- | A 'Timeout' value describes how long to wait and what to do upon timeout
@@ -184,21 +198,16 @@ tHookF l d a f = register l $ Hook (Just $ Timeout d a) f
 --
 -- This is essentially just a way to perform async actions using the KMonad hook
 -- system.
-after :: MonadK m
-  => Milliseconds
-  -> m ()
-  -> m ()
-after d a = do
-  let rehook t = after (d - t^.elapsed) a $> NoCatch
-  tHookF InputHook d a rehook
+after :: MonadK m => HookLocation -> Milliseconds -> m () -> m ()
+after l d a = do
+  let rehook t = after l (d - t^.elapsed) a $> NoCatch
+  tHookF l d a rehook
 
 -- | Perform an action immediately after the current action is finished. NOTE:
 -- there is no guarantee that another event doesn't outrace this, only that it
 -- will happen as soon as the CPU gets to it.
-whenDone :: MonadK m
-  => m ()
-  -> m ()
-whenDone = after 0
+whenDone :: MonadK m => HookLocation -> m () -> m ()
+whenDone l = after l 0
 
 
 -- | Create a KeyPred that matches the Press or Release of the current button.
@@ -206,38 +215,38 @@ matchMy :: MonadK m => Switch -> m KeyPred
 matchMy s = (==) <$> my s
 
 -- | Wait for an event to match a predicate and then execute an action
-await :: MonadKIO m => KeyPred -> (KeyEvent -> m Catch) -> m ()
-await p a = hookF InputHook $ \e -> if p e
+await :: MonadKIO m => HookLocation -> KeyPred -> (KeyEvent -> m Catch) -> m ()
+await l p a = hookF l $ \e -> if p e
   then a e
-  else await p a $> NoCatch
+  else await l p a $> NoCatch
 
 -- | Execute an action on the detection of the Switch of the active button.
-awaitMy :: MonadK m => Switch -> m Catch -> m ()
-awaitMy s a = matchMy s >>= flip await (const a)
+awaitMy :: MonadK m => HookLocation -> Switch -> m Catch -> m ()
+awaitMy l s a = matchMy s >>= \p -> await l p (const a)
 
 -- | Try to call a function on a succesful match of a predicate within a certain
 -- time period. On a timeout, perform an action.
 within :: MonadK m
-  => Milliseconds          -- ^ The time within which this filter is active
+  => HookLocation          -- ^ Where to install the hook
+  -> Milliseconds          -- ^ The time within which this filter is active
   -> m KeyPred             -- ^ The predicate used to find a match
   -> m ()                  -- ^ The action to call on timeout
   -> (Trigger -> m Catch)  -- ^ The action to call on a succesful match
   -> m ()                  -- ^ The resulting action
-within d p a f = do
+within l d p a f = do
   p' <- p
-  -- define f' to run action on predicate match, or rehook on predicate mismatch
   let f' t = if p' (t^.event)
         then f t
-        else within (d - t^.elapsed) p a f $> NoCatch
-  tHookF InputHook d a f'
+        else within l (d - t^.elapsed) p a f $> NoCatch
+  tHookF l d a f'
 
 -- | Like `within`, but acquires a hold when starting, and releases when done
 withinHeld :: MonadK m
-  => Milliseconds          -- ^ The time within which this filter is active
-  -> m KeyPred             -- ^ The predicate used to find a match
-  -> m ()                  -- ^ The action to call on timeout
-  -> (Trigger -> m Catch)  -- ^ The action to call on a succesful match
-  -> m ()                  -- ^ The resulting action
+  => Milliseconds
+  -> m KeyPred
+  -> m ()
+  -> (Trigger -> m Catch)
+  -> m ()
 withinHeld d p a f = do
   hold True
-  within d p (a <* hold False) (\x -> f x <* hold False)
+  within InputHookPrio d p (a <* hold False) (\x -> f x <* hold False)

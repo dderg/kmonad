@@ -16,8 +16,9 @@ at some point during execution be in the following situation:
 This means we need to be able to:
 1. Await events from some kind of rerun buffer
 2. Await events from the OS
-3. Do both of these things without ever entering a race-condition where we lose
-   an event because both 1. and 2. happen at exactly the same time.
+3. Await timer signals
+4. Do all of these things without ever entering a race-condition where we lose
+   an event because multiple things happen at exactly the same time.
 
 The Dispatch component provides the ability to read events from some IO action
 while at the same time providing a method to write events into the Dispatch,
@@ -43,62 +44,78 @@ where
 
 import KMonad.Prelude
 import KMonad.Keyboard
+import KMonad.Model.Action (WrappedEvent(..))
 import KMonad.Model.EventSrc
 
 import RIO.Seq (Seq(..), (><))
 import qualified RIO.Seq  as Seq
 import qualified RIO.Text as T
 
+import Data.Unique
+
 --------------------------------------------------------------------------------
 -- $env
---
--- The 'Dispatch' environment, describing what values are required to perform
--- the Dispatch operations, and constructors for creating such an environment.
 
 -- | The 'Dispatch' environment
 data Dispatch = Dispatch
-  { eventSrc  :: EventSrc IO            -- ^ How to read 1 event
-  , _rerunBuf :: TVar (Seq KeyEvent)    -- ^ Buffer for rerunning events
+  { eventSrc  :: EventSrc KeyEvent IO     -- ^ How to read 1 key event from the OS
+  , _rerunBuf :: TVar (Seq WrappedEvent)  -- ^ Buffer for rerunning wrapped events
+  , _injectTmr :: TMVar Unique            -- ^ Shared timer signal channel
   }
 makeLenses ''Dispatch
 
 -- | Create a new 'Dispatch' environment
-mkDispatch' :: MonadUnliftIO m => EventSrc m -> m Dispatch
-mkDispatch' s = withRunInIO $ \u -> do
+mkDispatch' :: MonadUnliftIO m => TMVar Unique -> EventSrc KeyEvent m -> m Dispatch
+mkDispatch' tmr s = withRunInIO $ \u -> do
   rrb <- newTVarIO Seq.empty
-  pure $ Dispatch (unliftESrc u s) rrb
+  pure $ Dispatch (unliftESrc u s) rrb tmr
 
 -- | Create a new 'Dispatch' environment in a 'ContT' environment
-mkDispatch :: MonadUnliftIO m => EventSrc m -> ContT r m Dispatch
-mkDispatch = lift . mkDispatch'
+mkDispatch :: MonadUnliftIO m => TMVar Unique -> EventSrc KeyEvent m -> ContT r m Dispatch
+mkDispatch tmr = lift . mkDispatch' tmr
 
 --------------------------------------------------------------------------------
 -- $op
---
--- The supported 'Dispatch' operations.
 
--- | Return the next event, this will return either (in order of precedence):
--- 1. The next item to be rerun
--- 2. A new item read from the OS
--- 3. Pausing until either 1. or 2. triggers
-pull :: (HasLogFunc e) => Dispatch -> EventSrc (RIO e)
+-- | Return the next event. Precedence:
+-- 1. Timer signals (WrappedTag)
+-- 2. Items from the rerun buffer (WrappedEvent)
+-- 3. New items from the OS (wrapped as WrappedKeyEvent)
+pull :: (HasLogFunc e) => Dispatch -> EventSrc WrappedEvent (RIO e)
 pull d@Dispatch{eventSrc = EventSrc{tryESrc, postESrc}} = EventSrc
-  { tryESrc = (Left <$> popRerun) `orElse` (Right <$> tryESrc)
+  { tryESrc =   (Left . Left  <$> takeTMVar (d^.injectTmr))
+        `orElse` (Left . Right <$> popRerun)
+        `orElse` (Right        <$> tryESrc)
   , postESrc = \case
-    Left e -> do
+    -- Timer signal: wrap as WrappedTag
+    Left (Left tag) -> do
       logDebug $ "\n" <> display (T.replicate 80 "-")
-              <> "\nRerunning event: " <> display e
-      pure $ Just e
-    Right e -> liftIO $ postESrc e
+              <> "\nTimer signal: " <> display (hashUnique tag)
+      pure $ Just (WrappedTag tag)
+
+    -- Rerun event: already wrapped
+    Left (Right we) -> do
+      case we of
+        WrappedKeyEvent e ->
+          logDebug $ "\n" <> display (T.replicate 80 "-")
+                  <> "\nRerunning event: " <> display e
+        WrappedTag tag ->
+          logDebug $ "\n" <> display (T.replicate 80 "-")
+                  <> "\nRerunning timer: " <> display (hashUnique tag)
+      pure $ Just we
+
+    -- OS event: wrap as WrappedKeyEvent
+    Right e -> liftIO (postESrc e) >>= \case
+      Nothing -> pure Nothing
+      Just ke -> pure $ Just (WrappedKeyEvent ke)
   }
   where
-    -- Pop the head off the rerun-buffer (or 'retrySTM' if empty)
     popRerun = readTVar (d^.rerunBuf) >>= \case
       Seq.Empty -> retrySTM
       (e :<| b) -> do
         writeTVar (d^.rerunBuf) b
         pure e
 
--- | Add a list of elements to be rerun.
-rerun :: (HasLogFunc e) => Dispatch -> [KeyEvent] -> RIO e ()
+-- | Add a list of wrapped events to be rerun.
+rerun :: (HasLogFunc e) => Dispatch -> [WrappedEvent] -> RIO e ()
 rerun d es = atomically $ modifyTVar (d^.rerunBuf) (>< Seq.fromList es)
