@@ -68,19 +68,22 @@ void input_callback(void *context, IOReturn result, void *sender, IOHIDValueRef 
 void open_matching_devices(char *product, io_iterator_t iter) {
     io_name_t name;
     kern_return_t kr;
-    CFStringRef cfproduct = NULL;
+    // product may list several exact names separated by '|'
+    CFArrayRef cfproducts = NULL;
     if(product) {
-        cfproduct = CFStringCreateWithCString(kCFAllocatorDefault, product, CFStringGetSystemEncoding());
+        CFStringRef cfproduct = CFStringCreateWithCString(kCFAllocatorDefault, product, CFStringGetSystemEncoding());
         if(cfproduct == NULL) {
             print_iokit_error("CFStringCreateWithCString");
             return;
         }
+        cfproducts = CFStringCreateArrayBySeparatingStrings(kCFAllocatorDefault, cfproduct, CFSTR("|"));
+        CFRelease(cfproduct);
     }
     CFStringRef cfkarabiner = CFStringCreateWithCString(kCFAllocatorDefault, "Karabiner ", CFStringGetSystemEncoding());
     if(cfkarabiner == NULL) {
         print_iokit_error("CFStringCreateWithCString");
-        if(product) {
-            CFRelease(cfproduct);
+        if(cfproducts) {
+            CFRelease(cfproducts);
         }
         return;
     }
@@ -93,8 +96,8 @@ void open_matching_devices(char *product, io_iterator_t iter) {
 
         // any device named "Karabiner ..." should be ignored
         bool match = !CFStringHasPrefix(cfcurr, cfkarabiner);
-        if(product) {
-            match = match && (CFStringCompare(cfcurr, cfproduct, 0) == kCFCompareEqualTo);
+        if(cfproducts) {
+            match = match && CFArrayContainsValue(cfproducts, CFRangeMake(0, CFArrayGetCount(cfproducts)), cfcurr);
         }
         CFRelease(cfcurr);
         if(!match) continue;
@@ -107,8 +110,8 @@ void open_matching_devices(char *product, io_iterator_t iter) {
         }
         IOHIDDeviceScheduleWithRunLoop(dev, listener_loop, kCFRunLoopDefaultMode);
     }
-    if(product) {
-        CFRelease(cfproduct);
+    if(cfproducts) {
+        CFRelease(cfproducts);
     }
     CFRelease(cfkarabiner);
 }
