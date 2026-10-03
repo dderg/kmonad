@@ -9,6 +9,8 @@ import Foreign.Marshal hiding (void)
 import Foreign.Ptr
 import Foreign.Storable
 import Foreign.C.String
+import qualified GHC.Foreign as GHC
+import GHC.IO.Encoding (utf8)
 
 import KMonad.Keyboard
 import KMonad.Keyboard.IO
@@ -54,7 +56,8 @@ iokitOpen m = do
 
     case m of
       Nothing -> void $ grab_kb nullPtr
-      Just s  -> void $ withCString s grab_kb
+      -- UTF-8 regardless of locale: launchd daemons run with no LANG (ASCII)
+      Just s  -> void $ GHC.withCString utf8 s grab_kb
 
     buf <- malloc @MacKeyEvent
     pure $ EvBuf buf

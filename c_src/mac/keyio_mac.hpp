@@ -71,7 +71,7 @@ void open_matching_devices(char *product, io_iterator_t iter) {
     // product may list several exact names separated by '|'
     CFArrayRef cfproducts = NULL;
     if(product) {
-        CFStringRef cfproduct = CFStringCreateWithCString(kCFAllocatorDefault, product, CFStringGetSystemEncoding());
+        CFStringRef cfproduct = CFStringCreateWithCString(kCFAllocatorDefault, product, kCFStringEncodingUTF8);
         if(cfproduct == NULL) {
             print_iokit_error("CFStringCreateWithCString");
             return;
