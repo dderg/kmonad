@@ -306,6 +306,11 @@ kcMapRaw =
   , ((0xC,0x6A), KeyGreen)
   , ((0xC,0x6B), KeyBlue)
   , ((0xC,0x6C), KeyYellow)
+  -- Output: lowest MacKeycode wins in revMap, so brightness is emitted here, not on
+  -- vendor top case (0xFF), which macOS ignores from the Karabiner virtual keyboard.
+  -- Same usages Karabiner-Elements emits for display_brightness_{in,de}crement.
+  , ((0xC,0x6F), KeyBrightnessUp)
+  , ((0xC,0x70), KeyBrightnessDown)
   , ((0xC,0x83), KeyLast)
   -- , ((0xC,0x84), Key???) -- Enter Channel
   -- , ((0xC,0x85), Key???) -- Order Movie
