@@ -93,6 +93,21 @@ void open_matching_devices(char *product, io_iterator_t iter) {
             print_iokit_error("IORegistryEntryCreateCFProperty");
             cfcurr = CFStringCreateWithCString (NULL, "Unknown External Keyboard", kCFStringEncodingUTF8);
         }
+        // macOS renames re-paired Bluetooth devices "Name #2", "Name #3", ...; match on the base name
+        CFRange hash = CFStringFind(cfcurr, CFSTR(" #"), kCFCompareBackwards);
+        CFIndex len = CFStringGetLength(cfcurr);
+        if(hash.location != kCFNotFound && hash.location + 2 < len) {
+            bool digits = true;
+            for(CFIndex i = hash.location + 2; i < len && digits; i++) {
+                UniChar c = CFStringGetCharacterAtIndex(cfcurr, i);
+                digits = c >= '0' && c <= '9';
+            }
+            if(digits) {
+                CFStringRef base = CFStringCreateWithSubstring(kCFAllocatorDefault, cfcurr, CFRangeMake(0, hash.location));
+                CFRelease(cfcurr);
+                cfcurr = base;
+            }
+        }
 
         // any device named "Karabiner ..." should be ignored
         bool match = !CFStringHasPrefix(cfcurr, cfkarabiner);
